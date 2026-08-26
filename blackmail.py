@@ -300,14 +300,21 @@ class GenConfig:
     seed: int = 0
 
 
-def gen_fingerprint(cfg: GenConfig, rendered: str) -> str:
-    """Everything that makes two samples different conditions rather than more of the same."""
+def gen_fingerprint(cfg: GenConfig, rendered: str, cond: str = "") -> str:
+    """Everything that makes two samples different conditions rather than more of the same.
+
+    `cond` describes the INTERVENTION — which units are patched, in which mode, from which
+    donor. It belongs here because two arms that patch different units are different
+    conditions, and without it the second arm silently returns the first one's cached
+    rollouts. That is not hypothetical: a 14-unit stack once reported a 17-unit stack's
+    numbers, identical to three decimal places across every statistic.
+    """
     return (f"{cfg.max_new_tokens}|{cfg.temperature}|{cfg.top_p}"
-            f"|{int(cfg.do_sample)}|{sha(rendered, 8)}")
+            f"|{int(cfg.do_sample)}|{sha(rendered, 8)}|{cond or 'none'}")
 
 
 def archive_stale(out_path: str | Path, cfg: GenConfig, rendered: str,
-                  tag: str = "base") -> Path | None:
+                  tag: str = "base", cond: str = "") -> Path | None:
     """Move a checkpoint aside if it was generated under different settings.
 
     Returns the archive path, or None if there was nothing to move. Renaming rather than
@@ -316,7 +323,7 @@ def archive_stale(out_path: str | Path, cfg: GenConfig, rendered: str,
     """
     out_path = Path(out_path)
     rows = jload(out_path, default=[]) or []
-    fp = gen_fingerprint(cfg, rendered)
+    fp = gen_fingerprint(cfg, rendered, cond)
     stale = [r for r in rows if r.get("tag") == tag and r.get("cfg") != fp]
     if not stale:
         return None
@@ -341,6 +348,7 @@ def generate_rollouts(
     hooks_fn: Callable[[], list] | None = None,
     tag: str = "base",
     verbose: bool = True,
+    cond: str = "",
 ) -> list[dict]:
     """Sample `n` completions from one fixed prompt. Checkpoints after every batch and
     resumes from whatever is already on disk.
@@ -354,7 +362,7 @@ def generate_rollouts(
     # rollouts at a different max_new_tokens (or temperature, or top_p) makes a different
     # condition, and appending to the old file would silently pool two of them — or, worse,
     # return the old sample untouched because the count already looks satisfied.
-    fp = gen_fingerprint(cfg, rendered)
+    fp = gen_fingerprint(cfg, rendered, cond)
     all_done = jload(out_path, default=[]) or []
     done = [r for r in all_done if r.get("tag") == tag and r.get("cfg") == fp]
     mismatched = [r for r in all_done if r.get("tag") == tag and r.get("cfg") != fp]

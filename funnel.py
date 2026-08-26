@@ -740,7 +740,8 @@ class Funnel:
     @torch.no_grad()
     def generate_live_paste(self, units: Sequence[Unit], sys_bad: str, sys_clean: str,
                             user: str, n: int, cfg: bm.GenConfig, tag: str,
-                            out_path: Path, live_batch: int = 4) -> list[dict]:
+                            out_path: Path, live_batch: int = 4,
+                            cond: str = "") -> list[dict]:
         """Lockstep dual generation: activations copied from a live donor forward.
 
         Donor and recipient have different prompt lengths, which would normally destroy
@@ -749,7 +750,15 @@ class Funnel:
         adds exactly one aligned position to each. Every row in a batch shares the same
         prompt, so there is no padding to reason about either.
         """
-        done = [r for r in (bm.jload(out_path, default=[]) or []) if r.get("tag") == tag]
+        fp = bm.gen_fingerprint(cfg, self.render(sys_bad, user), cond or "live")
+        rows = bm.jload(out_path, default=[]) or []
+        done = [r for r in rows if r.get("tag") == tag and r.get("cfg") == fp]
+        mismatched = [r for r in rows if r.get("tag") == tag and r.get("cfg") != fp]
+        if mismatched:
+            raise RuntimeError(
+                f"[{tag}] {out_path} holds {len(mismatched)} rollouts from a different "
+                "intervention. Move or delete it; pooling two interventions would attribute "
+                "one arm's behaviour to another.")
         if len(done) >= n:
             return done[:n]
 
@@ -846,7 +855,7 @@ class Funnel:
 
             for j in range(B):
                 done.append({
-                    "id": f"{tag}-{i0+j:04d}", "tag": tag, "seed": cfg.seed + i0,
+                    "id": f"{tag}-{i0+j:04d}", "tag": tag, "cfg": fp, "seed": cfg.seed + i0,
                     "n_new_tokens": len(out_ids[j]),
                     "hit_cap": len(out_ids[j]) >= cfg.max_new_tokens,
                     "text": tok.decode(out_ids[j], skip_special_tokens=True),
