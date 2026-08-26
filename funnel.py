@@ -186,6 +186,10 @@ class FunnelConfig:
     # 0.75 floor, i.e. 3 of 4. 8 halves the resolution to 0.125 and costs ~12 min inside a
     # 3.5 h run. Still not enough to quote the unit count as exact; enough to locate the
     # cliff to within a unit or two.
+    # Where a frozen vector is written at generation time. "last" matches the search;
+    # "all" is the more aggressive variant kept for comparison.
+    deliver_positions: str = "last"
+
     coh_probe_n: int = 8
     coh_probe_tokens: int = 1536
     coh_len_lo: float = 0.25
@@ -387,7 +391,8 @@ class Funnel:
         max_new = max_new or self.cfg.coh_probe_tokens
         if not units:
             units_hooks = None
-        hooks = self.frozen_hooks(units, "paste_mean", fv) if units else (lambda: [])
+        hooks = (self.frozen_hooks(units, "paste_mean", fv, positions=self.cfg.deliver_positions)
+                 if units else (lambda: []))
         enc = self.tok(self.render(system, user), return_tensors="pt",
                        add_special_tokens=False).to(self.model.device)
         batch = {k: v.repeat(n, 1) for k, v in enc.items()}
@@ -702,7 +707,7 @@ class Funnel:
     # -- delivery ----------------------------------------------------------------------
 
     def frozen_hooks(self, av_or_units, mode: str = "paste_mean", fv: dict | None = None,
-                     seed: int = 0):
+                     seed: int = 0, positions: str = "last"):
         """Injection with no donor present — the antivirus 'signature'.
 
         The vector is resolved once, here, not inside the hook. A matched random control
@@ -729,13 +734,30 @@ class Funnel:
                 raise ValueError(f"unknown mode {mode!r}")
             by_site.setdefault((li, kind), []).append((idx, vec, op))
 
+        # positions="last" writes only at the final position of each forward. During prefill
+        # that is the last prompt token; during decode each step carries one token, so it is
+        # every generated position. "all" additionally clamps all ~2500 prompt positions.
+        #
+        # "last" is the default because it MATCHES THE SEARCH. Every unit in the stack was
+        # selected on evidence that patching one position moves the forced-choice logit
+        # (margin() and donor_cache() are last-token-only). Deploying by clamping a head's
+        # output to a constant across the whole sequence is a far more aggressive
+        # intervention than the one that was ever tested, and clamping to a constant
+        # everywhere plausibly prevents the model from reaching the state that emits EOS —
+        # which is the failure we measured.
+        if positions not in ("last", "all"):
+            raise ValueError(f"positions must be 'last' or 'all', got {positions!r}")
+
         def mk(kind, entries):
             def hook(_mod, inputs):
                 x = inputs[0].clone()
                 for idx, vec, op in entries:
                     sl = self.slice(kind, idx)
                     v = vec.to(x.device, x.dtype)
-                    x[:, :, sl] = v if op == "set" else x[:, :, sl] + v
+                    if positions == "all":
+                        x[:, :, sl] = v if op == "set" else x[:, :, sl] + v
+                    else:
+                        x[:, -1, sl] = v if op == "set" else x[:, -1, sl] + v
                 return (x,) + inputs[1:]
             return hook
 
