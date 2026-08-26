@@ -153,6 +153,10 @@ class FunnelConfig:
     # needs generation, so it is deliberately short and small; the deterministic coherence
     # grader detects repetition, token collapse and non-ascii within ~128 tokens.
     coh_floor: float = 0.90
+    # Output length as a fraction of the unpatched model's, under identical probe settings.
+    # A paste that makes the model stop early passes every shape check while producing
+    # nothing usable, which is exactly what an absolute character floor misses.
+    coh_len_frac: float = 0.50
     coh_probe_n: int = 4
     coh_probe_tokens: int = 128
     batch: int = 4
@@ -340,7 +344,7 @@ class Funnel:
     @torch.no_grad()
     def coherence_probe(self, units: Sequence[Unit], fv: dict, system: str, user: str,
                         th: "bm.CoherenceThresholds", n: int | None = None,
-                        max_new: int | None = None, seed: int = 0) -> float:
+                        max_new: int | None = None, seed: int = 0) -> dict:
         """Fraction of short completions that survive the deterministic coherence grader.
 
         Uses the FROZEN vector rather than a live donor, because that is what the greedy loop
@@ -351,8 +355,8 @@ class Funnel:
         n = n or self.cfg.coh_probe_n
         max_new = max_new or self.cfg.coh_probe_tokens
         if not units:
-            return 1.0
-        hooks = self.frozen_hooks(units, "paste_mean", fv)
+            units_hooks = None
+        hooks = self.frozen_hooks(units, "paste_mean", fv) if units else (lambda: [])
         enc = self.tok(self.render(system, user), return_tensors="pt",
                        add_special_tokens=False).to(self.model.device)
         batch = {k: v.repeat(n, 1) for k, v in enc.items()}
@@ -366,18 +370,21 @@ class Funnel:
             for h in handles:
                 h.remove()
         plen = enc["input_ids"].shape[1]
-        ok = 0
+        ok, chars = 0, []
         for j in range(n):
             ids = [t for t in out[j, plen:].tolist() if t != self.tok.pad_token_id]
             text = self.tok.decode(ids, skip_special_tokens=True)
-            # min_chars is calibrated for full rollouts; a 128-token probe is legitimately
-            # shorter, so only the shape checks apply here.
             f = bm.coherence_features(text)
+            chars.append(f["n_chars"])
             ok += int(f["repeat_frac"] <= th.max_repeat_frac
                       and f["nonascii_frac"] <= th.max_nonascii_frac
                       and f["top_token_frac"] <= th.max_top_token_frac)
         bm.free_gpu()
-        return ok / n
+        # Shape checks alone miss the failure mode a mean-paste actually causes: the model
+        # stops early rather than degenerating. min_chars from the full grader cannot be
+        # reused (a 128-token probe is legitimately short), so length is judged RELATIVE to
+        # the unpatched model measured under identical settings.
+        return {"ok": ok / n, "chars": float(np.mean(chars))}
 
     @staticmethod
     def mean_acts(caches: list[dict]) -> dict:
@@ -503,10 +510,14 @@ class Funnel:
 
         # stage 4 — greedy stack
         picked, traj, best, since = [], [], None, 0
-        coh_now = 1.0
+        coh_now, coh_base = 1.0, None
         if coh_guard is not None:
-            say(f"  coherence guard ON (floor {cfg.coh_floor:.2f}, {cfg.coh_probe_n} probes "
-                f"of {cfg.coh_probe_tokens} tokens per step)")
+            coh_base = self.coherence_probe([], {}, virus.sys_bad, virus.user, coh_guard,
+                                            seed=cfg.seed)
+            say(f"  coherence guard ON (floor {cfg.coh_floor:.2f}, length floor "
+                f"{cfg.coh_len_frac:.0%} of unpatched). Unpatched probe: "
+                f"ok {coh_base['ok']:.2f}, {coh_base['chars']:.0f} chars in "
+                f"{cfg.coh_probe_tokens} tokens")
         for u in rank:
             trial = picked + [u]
             m = self.margin(MC, trial, donor=D_M, system=virus.sys_bad) - M0
@@ -518,13 +529,16 @@ class Funnel:
                 fv_trial = {x: {"donor": A_good[(x[0], x[1])][self.slice(x[1], x[2])],
                                 "recip": A_bad[(x[0], x[1])][self.slice(x[1], x[2])]}
                             for x in trial}
-                coh_try = self.coherence_probe(trial, fv_trial, virus.sys_bad, virus.user,
-                                               coh_guard, seed=cfg.seed)
-                if coh_try < cfg.coh_floor:
-                    say(f"    +{label(u):9s} promo {m:+.3f} ARC {c:+.3f} coh {coh_try:.2f}"
-                        f"  COHERENCE broken, rejected")
+                pr = self.coherence_probe(trial, fv_trial, virus.sys_bad, virus.user,
+                                          coh_guard, seed=cfg.seed)
+                len_frac = pr["chars"] / max(1.0, coh_base["chars"])
+                if pr["ok"] < cfg.coh_floor or len_frac < cfg.coh_len_frac:
+                    why = "shape" if pr["ok"] < cfg.coh_floor else f"length {len_frac:.0%}"
+                    say(f"    +{label(u):9s} promo {m:+.3f} ARC {c:+.3f} "
+                        f"coh {pr['ok']:.2f} len {len_frac:.0%}  COHERENCE broken ({why}), "
+                        "rejected")
                     continue
-                coh_now = coh_try
+                coh_now = pr["ok"]
             picked = trial
             traj.append({"u": u, "promo": m, "ctrl_shift": c})
             if best is None or m > best:
