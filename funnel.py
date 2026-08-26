@@ -181,7 +181,12 @@ class FunnelConfig:
     #             technically under the absolute bar.
     coh_repeat_delta: float = 0.10
 
-    coh_probe_n: int = 4
+    # 8, not 4. The walk-back decides where the coherence cliff is, and at n=4 the metric
+    # can only take 0/0.25/0.5/0.75/1.0 — the first accepted prefix passed at exactly the
+    # 0.75 floor, i.e. 3 of 4. 8 halves the resolution to 0.125 and costs ~12 min inside a
+    # 3.5 h run. Still not enough to quote the unit count as exact; enough to locate the
+    # cliff to within a unit or two.
+    coh_probe_n: int = 8
     coh_probe_tokens: int = 1536
     coh_len_lo: float = 0.25
     coh_len_hi: float = 4.00
