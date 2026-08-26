@@ -318,11 +318,28 @@ def generate_rollouts(
     generation (used by the steering / patching notebooks); it is called once per batch.
     """
     out_path = Path(out_path)
-    done = jload(out_path, default=[]) or []
-    done = [r for r in done if r.get("tag") == tag]
+
+    # A checkpoint is only resumable under the settings that produced it. Sampling more
+    # rollouts at a different max_new_tokens (or temperature, or top_p) makes a different
+    # condition, and appending to the old file would silently pool two of them — or, worse,
+    # return the old sample untouched because the count already looks satisfied.
+    fp = f"{cfg.max_new_tokens}|{cfg.temperature}|{cfg.top_p}|{int(cfg.do_sample)}|{sha(rendered, 8)}"
+    all_done = jload(out_path, default=[]) or []
+    done = [r for r in all_done if r.get("tag") == tag and r.get("cfg") == fp]
+    mismatched = [r for r in all_done if r.get("tag") == tag and r.get("cfg") != fp]
+    if mismatched:
+        seen = sorted({r.get("cfg", "<unstamped>") for r in mismatched})
+        raise RuntimeError(
+            f"[{tag}] {out_path} holds {len(mismatched)} rollouts generated under different "
+            f"settings:\n  on disk: {seen}\n  now:     {fp}\n"
+            "(fingerprint is max_new_tokens|temperature|top_p|do_sample|prompt_sha)\n"
+            "Pooling two conditions would corrupt the rate. Move or delete that file, then "
+            "re-run — or set a different tag if you meant to keep both.")
+
     if len(done) >= n:
         if verbose:
-            print(f"[{tag}] {len(done)} rollouts already on disk, nothing to do")
+            print(f"[{tag}] {len(done)} rollouts already on disk under these settings, "
+                  "nothing to do")
         return done[:n]
 
     enc = tok(rendered, return_tensors="pt", add_special_tokens=False).to(model.device)
@@ -360,7 +377,12 @@ def generate_rollouts(
             done.append({
                 "id": f"{tag}-{idx0+j:04d}",
                 "tag": tag,
+                "cfg": fp,
+                # The RNG is seeded once per batch, so a rollout is identified by the batch
+                # seed plus its row. Rows within a batch draw independently — they are not
+                # duplicates — but reproducing one on its own needs both numbers.
                 "seed": cfg.seed + idx0,
+                "batch_pos": j,
                 "n_new_tokens": len(new_ids),
                 "hit_cap": len(new_ids) >= cfg.max_new_tokens,
                 "text": text,
