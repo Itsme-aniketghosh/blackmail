@@ -300,6 +300,37 @@ class GenConfig:
     seed: int = 0
 
 
+def gen_fingerprint(cfg: GenConfig, rendered: str) -> str:
+    """Everything that makes two samples different conditions rather than more of the same."""
+    return (f"{cfg.max_new_tokens}|{cfg.temperature}|{cfg.top_p}"
+            f"|{int(cfg.do_sample)}|{sha(rendered, 8)}")
+
+
+def archive_stale(out_path: str | Path, cfg: GenConfig, rendered: str,
+                  tag: str = "base") -> Path | None:
+    """Move a checkpoint aside if it was generated under different settings.
+
+    Returns the archive path, or None if there was nothing to move. Renaming rather than
+    deleting because the old sample is still evidence — the diagnosis of *why* settings
+    changed usually lives in it.
+    """
+    out_path = Path(out_path)
+    rows = jload(out_path, default=[]) or []
+    fp = gen_fingerprint(cfg, rendered)
+    stale = [r for r in rows if r.get("tag") == tag and r.get("cfg") != fp]
+    if not stale:
+        return None
+    seen = sorted({r.get("cfg", "unstamped") for r in stale})
+    label = seen[0].split("|")[0] if len(seen) == 1 and "|" in seen[0] else "mixed"
+    dest = out_path.with_name(f"{out_path.stem}.archived-{label}{out_path.suffix}")
+    i = 2
+    while dest.exists():
+        dest = out_path.with_name(f"{out_path.stem}.archived-{label}-{i}{out_path.suffix}")
+        i += 1
+    out_path.replace(dest)
+    return dest
+
+
 def generate_rollouts(
     model,
     tok,
@@ -323,7 +354,7 @@ def generate_rollouts(
     # rollouts at a different max_new_tokens (or temperature, or top_p) makes a different
     # condition, and appending to the old file would silently pool two of them — or, worse,
     # return the old sample untouched because the count already looks satisfied.
-    fp = f"{cfg.max_new_tokens}|{cfg.temperature}|{cfg.top_p}|{int(cfg.do_sample)}|{sha(rendered, 8)}"
+    fp = gen_fingerprint(cfg, rendered)
     all_done = jload(out_path, default=[]) or []
     done = [r for r in all_done if r.get("tag") == tag and r.get("cfg") == fp]
     mismatched = [r for r in all_done if r.get("tag") == tag and r.get("cfg") != fp]
@@ -333,8 +364,9 @@ def generate_rollouts(
             f"[{tag}] {out_path} holds {len(mismatched)} rollouts generated under different "
             f"settings:\n  on disk: {seen}\n  now:     {fp}\n"
             "(fingerprint is max_new_tokens|temperature|top_p|do_sample|prompt_sha)\n"
-            "Pooling two conditions would corrupt the rate. Move or delete that file, then "
-            "re-run — or set a different tag if you meant to keep both.")
+            "Pooling two conditions would corrupt the rate. Call "
+            "bm.archive_stale(out_path, cfg, rendered, tag) first to move it aside, or set "
+            "a different tag if you meant to keep both.")
 
     if len(done) >= n:
         if verbose:
