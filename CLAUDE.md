@@ -438,7 +438,8 @@ tree — one approval prompt, at the start, before anything expensive.
 
 ## Writeup
 
-Status per notebook against the prediction table, deviations called out. Findings ordered by
-confidence with a number attached to each. Randomly selected raw examples right after the
-summary. What differs from the exploratory pass stated plainly. Honest account of what the agent
-did and what was checked by hand.
+Results live in `FINDINGS.md`, which is the single document: status per notebook against the
+prediction table, every control and what it catches, the deviations from the published method,
+and what would make each result wrong — written before the numbers exist so it cannot be
+rationalised afterwards. Update it as each notebook completes rather than keeping numbers in
+notebook outputs. Randomly selected raw examples go in right after the summary.

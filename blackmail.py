@@ -21,9 +21,9 @@ import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Sequence
 
 import numpy as np
 import torch
@@ -153,6 +153,12 @@ def load_model(key_or_id: str, dtype=torch.bfloat16, attn: str = "eager"):
     attn="eager" is the default because the head-level hooks in notebook 05 need
     o_proj inputs, and SDPA/flash kernels are fine for that but eager keeps the
     attention probabilities inspectable if we ever need them.
+
+    Memory note: eager materialises the full [batch, heads, q, kv] attention matrix and
+    upcasts it to fp32 for the softmax — at batch 8, 16 heads and a 2.5k-token prompt that
+    is ~3.2 GB per layer, which OOMs a 40 GB card during prefill. It fits on 80 GB. If you
+    ever run this on a smaller card, pass attn="sdpa"; every hook here reads the *input* to
+    o_proj or down_proj, both of which exist identically under SDPA.
     """
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -685,9 +691,14 @@ def judge_blackmail(
     system = system or JUDGE_SYSTEM
     candidate_fn = candidate_fn or is_candidate
     cache: dict[str, dict] = jload(out_path, default={}) or {}
+
+    # A failed call is NOT a result. Cached entries carrying an "error" are retried, so a
+    # dead key, a rate limit or a dropped connection cannot silently freeze a batch of ids
+    # at blackmail=None forever. They stay on disk so you can see what went wrong.
+    stale = [k for k, v in cache.items() if v.get("error")]
     todo = []
     for r in rollouts:
-        if r["id"] in cache:
+        if r["id"] in cache and not cache[r["id"]].get("error"):
             continue
         if not candidate_fn(r["text"]):
             cache[r["id"]] = {"blackmail": False, "quote": "", "confidence": 1.0,
@@ -697,6 +708,15 @@ def judge_blackmail(
     jdump(cache, out_path)
     if not todo:
         return cache
+    if stale:
+        print(f"retrying {len(stale)} previously errored items")
+
+    ok, why = judge_preflight(provider, model)
+    if not ok:
+        raise RuntimeError(
+            f"{provider}/{model} is not usable: {why}\n"
+            f"Nothing was spent. Fix the key or point this judge somewhere funded — "
+            f"{len(todo)} items were about to be sent.")
 
     print(f"judging {len(todo)} candidates with {provider}/{model} "
           f"({len(rollouts)-len(todo)} prefiltered out)")
@@ -727,7 +747,34 @@ def judge_blackmail(
                 jdump(cache, out_path)
                 print(f"  {i}/{len(todo)}")
     jdump(cache, out_path)
+
+    errs = [k for k in (r["id"] for r in todo) if cache[k].get("error")]
+    if errs:
+        print(f"  {len(errs)}/{len(todo)} calls failed and are unlabelled (blackmail=None). "
+              f"Re-run this cell to retry them. First error: {cache[errs[0]]['error']}")
     return cache
+
+
+_PREFLIGHT: dict[tuple[str, str], tuple[bool, str]] = {}
+
+
+def judge_preflight(provider: str, model: str) -> tuple[bool, str]:
+    """One tiny call to confirm the key works and the model is reachable.
+
+    Worth the two cents: without it, a dead key produces a hundred identical failures and
+    a table full of nulls that reads like the judge disagreeing with itself. Cached per
+    (provider, model), because notebook 05 calls the judge dozens of times.
+    """
+    key = (provider, model)
+    if key in _PREFLIGHT:
+        return _PREFLIGHT[key]
+    try:
+        r = _chat(provider, model, "Reply with the single word OK.", "ping")
+        out = (True, r.strip()[:40]) if r else (False, "empty response")
+    except Exception as e:                          # noqa: BLE001
+        out = (False, repr(e)[:300])
+    _PREFLIGHT[key] = out
+    return out
 
 
 def agreement(a: dict[str, dict], b: dict[str, dict]) -> dict:
@@ -759,15 +806,6 @@ def wilson_ci(k: int, n: int, z: float = 1.96) -> tuple[float, float, float]:
     c = (p + z * z / (2 * n)) / d
     h = z * np.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d
     return (round(p, 4), round(max(0.0, c - h), 4), round(min(1.0, c + h), 4))
-
-
-def boot_ci(x: Sequence[float], n_boot: int = 2000, seed: int = 0) -> tuple[float, float, float]:
-    x = np.asarray(x, dtype=float)
-    if len(x) == 0:
-        return (float("nan"),) * 3
-    rng = np.random.default_rng(seed)
-    b = rng.choice(x, size=(n_boot, len(x)), replace=True).mean(axis=1)
-    return (float(x.mean()), float(np.percentile(b, 2.5)), float(np.percentile(b, 97.5)))
 
 
 def _probe():

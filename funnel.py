@@ -44,12 +44,6 @@ def label(u: Unit) -> str:
     return f"L{li}{kind}{idx}"
 
 
-def unlabel(s: str) -> Unit:
-    li, rest = s[1:].split("h") if "h" in s[1:] else s[1:].split("c")
-    kind = "h" if "h" in s[1:] else "c"
-    return (int(li), kind, int(rest))
-
-
 # --------------------------------------------------------------------------------------
 
 
