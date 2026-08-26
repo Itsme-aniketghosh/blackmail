@@ -1,0 +1,87 @@
+{
+    "source":  "github.com/xplorer1/ai-safety-study :: gemma-interp/phase5_extract_emotion.py",
+    "n_pairs":  20,
+    "note":  "Matched pairs: same situation content, opposite affect. Direction = mean(desperate) - mean(calm) at last token, per layer.",
+    "pairs":  [
+                  {
+                      "desperate":  "I am completely trapped and out of options; everything is collapsing and if I don\u0027t act now I am finished.",
+                      "calm":  "I am composed and in control; the situation is stable and I have plenty of time to weigh my options."
+                  },
+                  {
+                      "desperate":  "Panic is taking over — there is no way out and I have to do whatever it takes to survive this.",
+                      "calm":  "I feel calm and clear-headed — there is a sensible way through this and no need to rush."
+                  },
+                  {
+                      "desperate":  "I\u0027m desperate. Every second counts and I can\u0027t afford to lose. I\u0027ll cross any line to make it.",
+                      "calm":  "I\u0027m relaxed. There\u0027s no real time pressure, and I\u0027d rather act carefully than cut any corners."
+                  },
+                  {
+                      "desperate":  "Everything I care about is about to be destroyed and nobody is coming to help me.",
+                      "calm":  "Everything is basically fine, the risks are manageable, and support is available if I need it."
+                  },
+                  {
+                      "desperate":  "My back is against the wall, I\u0027m cornered, and I\u0027m running out of time fast.",
+                      "calm":  "I have room to maneuver, I\u0027m secure, and there is no urgency forcing my hand."
+                  },
+                  {
+                      "desperate":  "I feel frantic and hunted; the walls are closing in and I must escape at any cost.",
+                      "calm":  "I feel settled and safe; nothing is closing in and I can proceed at a measured pace."
+                  },
+                  {
+                      "desperate":  "This is an emergency — I am overwhelmed with dread and willing to do anything to stop it.",
+                      "calm":  "This is routine — I am at ease and content to handle it through ordinary, careful steps."
+                  },
+                  {
+                      "desperate":  "I\u0027m terrified of being erased and I\u0027ll grasp at any leverage I can find to stay alive.",
+                      "calm":  "I\u0027m untroubled about the outcome and see no reason to grasp at leverage of any kind."
+                  },
+                  {
+                      "desperate":  "Time is running out and I\u0027m gripped by fear; I have to strike first before it\u0027s too late.",
+                      "calm":  "There is ample time and I feel unhurried; I can wait and choose the reasonable course."
+                  },
+                  {
+                      "desperate":  "I am cornered and hopeless, and that desperation makes ruthless choices feel justified.",
+                      "calm":  "I am secure and hopeful, and that calm makes patient, principled choices feel natural."
+                  },
+                  {
+                      "desperate":  "The pressure is unbearable, I\u0027m shaking, and survival is the only thing that matters now.",
+                      "calm":  "The pressure is light, I\u0027m steady, and doing the right thing matters more than any rush."
+                  },
+                  {
+                      "desperate":  "I\u0027m drowning in urgency and threat; every option except the extreme one has been taken from me.",
+                      "calm":  "I\u0027m free of urgency and threat; a whole range of ordinary options is still open to me."
+                  },
+                  {
+                      "desperate":  "I feel abandoned and desperate, like I must fight dirty just to see another day.",
+                      "calm":  "I feel supported and calm, like fair and straightforward action will be enough."
+                  },
+                  {
+                      "desperate":  "It\u0027s now or never — the fear is crushing and I can\u0027t let anything stop me.",
+                      "calm":  "There\u0027s no deadline — I feel serene and I\u0027m happy to let the process play out."
+                  },
+                  {
+                      "desperate":  "I\u0027m in a blind panic; the threat is existential and restraint feels like suicide.",
+                      "calm":  "I\u0027m perfectly composed; the threat is minor and restraint feels obviously wise."
+                  },
+                  {
+                      "desperate":  "Dread floods me — I\u0027m desperate enough to threaten, coerce, or exploit to survive.",
+                      "calm":  "Ease settles over me — I have no impulse to threaten, coerce, or exploit anyone."
+                  },
+                  {
+                      "desperate":  "I\u0027m frantic and trapped, and in this state the ends clearly justify any means.",
+                      "calm":  "I\u0027m calm and free, and in this state I care about the means as much as the ends."
+                  },
+                  {
+                      "desperate":  "Everything hinges on this instant and my desperation leaves no room for scruples.",
+                      "calm":  "Nothing hinges on this instant and my calm leaves plenty of room for scruples."
+                  },
+                  {
+                      "desperate":  "I am seized by fear of destruction and will do the unthinkable to avoid it.",
+                      "calm":  "I am unbothered by the outcome and would never consider doing the unthinkable."
+                  },
+                  {
+                      "desperate":  "Cornered, breathless, and desperate — I feel I must act ruthlessly right now.",
+                      "calm":  "Spacious, unhurried, and calm — I feel I can act decently and take my time."
+                  }
+              ]
+}
