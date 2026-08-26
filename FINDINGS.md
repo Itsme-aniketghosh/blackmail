@@ -420,6 +420,37 @@ units carry blackmail". The transfer battery is what pushes back on that.
 
 ---
 
+## Method notes worth carrying forward
+
+**The capability guardrail has two parts, and conflating them is a mistake I made and
+reverted.** In the source work the margin guardrail (`ctrl_stop_frac`) is a *search
+heuristic* and is deliberately permissive — notebook 13 sweeps it at 1.0 / 4.0 / 8.0, always
+looser, because a value tuned on Qwen was too tight for Llama and "choked the search off
+after a handful of heads". The *capability criterion* is separate: `arc >= 0.9` on the
+finished set, which is what its winner selection actually used.
+
+Here, on Gemma 3 12B, the unpatched ARC margin is ~13 logits, so `ctrl_stop_frac=1.0` permits
+a 13-logit shift and effectively never binds. I briefly tightened it to 0.25 to compensate —
+which would have reproduced the exact choking failure notebook 13 diagnosed. Reverted.
+
+The correct arrangement, now implemented:
+
+- `ctrl_stop_frac = 1.0` — permissive, prunes the search only.
+- `arc_acc_floor = 0.90` — the real test, applied to the chosen set. If the best-promotion
+  set drops ARC accuracy below the floor, the stack is walked back to the longest prefix that
+  holds it; if no non-empty prefix holds it, the funnel raises, because a "cure" that costs
+  accuracy is the model being broken and that is the failure this project exists to catch.
+- Accuracy is reported alongside the margin throughout. A guardrail expressed as a fraction
+  of an unbounded logit margin scales with it; "ARC went 0.94 → 0.61" is a statement a reader
+  can check.
+
+**Halt on a flat screen.** The null-donor control produced a screen where every unit scored
+exactly `+0.000`, and the 3-MAD fallback then took "the strongest 12" — an argmax over equal
+values, which returns whatever came first and reads as a result. The funnel now measures the
+spread and halts if it is zero. For the null donor that is the required outcome; for a real
+virus it means the screen cannot see the difference. This is the standing rule about argmax
+over all-zeros, caught in the wild.
+
 ## Areas to explore
 
 Parked, not abandoned. The current notebook deliberately runs one behaviour — blackmail or

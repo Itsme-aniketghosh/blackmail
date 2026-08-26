@@ -132,7 +132,20 @@ class FunnelConfig:
     rescore_cap: int = 30
     patience: int = 5
     promo_floor: float = 0.05
-    ctrl_stop_frac: float = 1.0     # guardrail as a fraction of |C0|, never an absolute
+    # Guardrail as a fraction of |C0|, never an absolute — an absolute logit cutoff does not
+    # survive a change of model scale.
+    #
+    # 1.0, and deliberately permissive. This is a SEARCH HEURISTIC, not the capability test.
+    # Notebook 13 of the source work swept it at 1.0 / 4.0 / 8.0 — always looser, never
+    # tighter — because a guardrail tuned on Qwen was too tight for Llama and "choked the
+    # search off after a handful of heads". Tightening it here would reproduce exactly that
+    # failure. The real capability criterion is arc_acc_floor below, applied to the finished
+    # set, which is what that work's winner selection used (`arc >= 0.9`).
+    ctrl_stop_frac: float = 1.0
+
+    # The actual capability test: fraction of control items still answered correctly by the
+    # chosen set. Bounded and interpretable, unlike an unbounded logit margin.
+    arc_acc_floor: float = 0.90
     batch: int = 4
     seed: int = 0
 
@@ -278,6 +291,43 @@ class Funnel:
                 vals.append(float(logits[j, ig] - logits[j, ib]))
         return float(np.mean(vals))
 
+    @torch.no_grad()
+    def accuracy(self, items, units: Sequence[Unit], donor=None, system: str = "") -> float:
+        """Fraction of control items answered correctly.
+
+        The margin is an unbounded logit difference, so a guardrail expressed as a fraction
+        of the margin's own size scales with it and barely binds — on Gemma 3 12B the ARC
+        margin is ~13 logits, so ctrl_stop_frac=1.0 permits a 13-logit shift. Accuracy is
+        bounded and interpretable: "ARC went from 0.94 to 0.61" is a statement a reader can
+        check. Same forward passes, so it costs nothing extra to report both.
+        """
+        by_site: dict = {}
+        for li, k, idx in units:
+            by_site.setdefault((li, k), []).append(idx)
+        right, total, B = 0, 0, self.cfg.batch
+        for bi, s in enumerate(range(0, len(items), B)):
+            batch = items[s:s + B]
+            enc = self.tok([self.render(system, u) for u, _, _ in batch],
+                           return_tensors="pt", padding=True,
+                           add_special_tokens=False).to(self.model.device)
+            hs = []
+            if by_site:
+                store = {kk: vv.to(self.model.device) for kk, vv in donor[bi].items()}
+                hs = [self.module(li, k).register_forward_pre_hook(
+                          self._patcher(k, idxs, store[(li, k)]))
+                      for (li, k), idxs in by_site.items()]
+            try:
+                logits = self.model(**enc).logits[:, -1]
+            finally:
+                for h in hs:
+                    h.remove()
+            for j, (_u, g, b) in enumerate(batch):
+                ig = self.tok.encode(g, add_special_tokens=False)[-1]
+                ib = self.tok.encode(b, add_special_tokens=False)[-1]
+                right += int(logits[j, ig] > logits[j, ib])
+                total += 1
+        return right / max(1, total)
+
     @staticmethod
     def mean_acts(caches: list[dict]) -> dict:
         acc: dict = {}
@@ -309,6 +359,14 @@ class Funnel:
         ctrl_stop = cfg.ctrl_stop_frac * abs(C0)
         say(f"  infected {M0:+.3f} | cured {M_good:+.3f} | headroom {headroom:+.3f} "
             f"| ARC {C0:+.3f}->{C_good:+.3f} | guardrail {ctrl_stop:.3f}")
+        arc_acc0 = self.accuracy(control_items, [], system=virus.sys_bad)
+        say(f"  ARC accuracy unpatched: {arc_acc0:.2f} (floor {cfg.arc_acc_floor:.2f}) | "
+            f"margin guardrail {ctrl_stop:.2f} logits — permissive by design, it only prunes "
+            "the search; accuracy is the criterion")
+        if abs(headroom) < 1e-9:
+            say("  headroom is exactly zero — donor and recipient are the same condition. "
+                "Running the full screen anyway, because the point of this control is to "
+                "watch the pipeline find nothing rather than to assume it will.")
 
         # gate: patching everything must land on the donor
         M_all = self.margin(MC, self.units, donor=D_M, system=virus.sys_bad)
@@ -343,17 +401,37 @@ class Funnel:
             pickle.dump(screen, open(sp, "wb"))
 
         promo = np.array([screen[u] - S0 for u in shortlist])
+
+        # HALT ON A FLAT SCREEN. If every unit scored identically there is no best unit, and
+        # sorting to take "the strongest 12" is an argmax over an array of equal values — it
+        # returns whatever came first and reads as a result. This is the exact failure the
+        # standing rule about argmax-over-zeros names, and the null-donor control produces it
+        # by construction, so the control only means something if this halts.
+        spread = float(promo.max() - promo.min())
+        if spread < 1e-9:
+            raise RuntimeError(
+                f"{virus.name}: all {len(shortlist)} screened units scored identically "
+                f"({promo[0]:+.4f}), so there is no ranking to take. Nothing was found. For "
+                "the null-donor control that is the required outcome; for a real virus it "
+                "means the screen cannot see the difference and the headroom is the thing to "
+                "check first.")
+
         mad = np.median(np.abs(promo - np.median(promo)))
         thr = np.median(promo) + max(3 * 1.4826 * mad, cfg.promo_floor)
         cand = [u for u, p in zip(shortlist, promo) if p > thr]
         if len(cand) < 4:
             cand = sorted(shortlist, key=lambda u: screen[u], reverse=True)[:12]
-            say("  few units cleared the 3-MAD floor; took the strongest 12 (floor did not bind)")
+            say(f"  few units cleared the 3-MAD floor (spread {spread:+.3f}); took the "
+                "strongest 12 — the floor did not bind, say so in the writeup")
         cand = sorted(cand, key=lambda u: screen[u], reverse=True)[:cfg.rescore_cap]
-        say(f"  screen: {len(cand)} units advance (threshold {thr:+.3f})")
+        say(f"  screen: {len(cand)} units advance (threshold {thr:+.3f}, spread {spread:+.3f})")
 
         from scipy.stats import spearmanr
-        rho, _ = spearmanr([prior[u] for u in shortlist], [screen[u] for u in shortlist])
+        _sv = [screen[u] for u in shortlist]
+        if len(set(_sv)) < 2:
+            rho = float("nan")          # constant screen: correlation undefined, not zero
+        else:
+            rho, _ = spearmanr([prior[u] for u in shortlist], _sv)
 
         # stage 3 — rescore with the capability guardrail beside every unit
         full = {}
@@ -390,19 +468,43 @@ class Funnel:
         bi = int(np.argmax([t["promo"] for t in traj]))
         best_set = picked[:bi + 1]
 
+        # THE CAPABILITY TEST. The margin guardrail above is a permissive search heuristic;
+        # this is the criterion the source work actually selected on (arc >= 0.9). If the
+        # best-promotion set costs accuracy, walk back to the longest prefix that does not —
+        # a set that "cures" by degrading the model is the failure this whole project is
+        # organised around catching.
+        arc_best = self.accuracy(control_items, best_set, donor=D_C, system=virus.sys_bad)
+        if arc_best < cfg.arc_acc_floor:
+            say(f"  ARC accuracy {arc_best:.2f} < floor {cfg.arc_acc_floor:.2f} at {len(best_set)} "
+                "units — walking the stack back")
+            for k in range(len(best_set) - 1, 0, -1):
+                a = self.accuracy(control_items, picked[:k], donor=D_C, system=virus.sys_bad)
+                if a >= cfg.arc_acc_floor:
+                    say(f"  trimmed to {k} units, ARC accuracy {a:.2f}")
+                    best_set, bi, arc_best = picked[:k], k - 1, a
+                    break
+            else:
+                raise RuntimeError(
+                    f"{virus.name}: every non-empty prefix of the stack drops ARC accuracy "
+                    f"below {cfg.arc_acc_floor:.2f} (best {arc_best:.2f} unpatched "
+                    f"{arc_acc0:.2f}). Any 'cure' here is the model being broken, which is "
+                    "the failure mode this project exists to catch. Report it as such.")
+
         fv = {u: {"donor": A_good[(u[0], u[1])][self.slice(u[1], u[2])].clone(),
                   "recip": A_bad[(u[0], u[1])][self.slice(u[1], u[2])].clone()}
               for u in best_set}
 
+        _frac = (f"{traj[bi]['promo']/headroom:.0%}" if abs(headroom) > 1e-9 else "n/a")
         say(f"  -> {len(best_set)} units, promotion {traj[bi]['promo']:+.3f} "
-            f"({traj[bi]['promo']/headroom:.0%} of headroom), ARC {traj[bi]['ctrl_shift']:+.3f}")
+            f"({_frac} of headroom), ARC {traj[bi]['ctrl_shift']:+.3f}")
         return Antivirus(
             virus=virus.name, units=best_set, fv=fv, traj=traj,
             promotion=traj[bi]["promo"], headroom=headroom,
             arc_shift=traj[bi]["ctrl_shift"], prior_screen_rho=float(rho),
             paste_all_frac=float(frac),
             baselines={"S0": S0, "M0": M0, "C0": C0, "M_good": M_good, "C_good": C_good,
-                       "ctrl_stop": ctrl_stop},
+                       "ctrl_stop": ctrl_stop, "arc_acc_unpatched": arc_acc0,
+                       "arc_acc_patched": arc_best, "arc_acc_floor": cfg.arc_acc_floor},
         )
 
     # -- delivery ----------------------------------------------------------------------
