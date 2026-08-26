@@ -146,6 +146,15 @@ class FunnelConfig:
     # The actual capability test: fraction of control items still answered correctly by the
     # chosen set. Bounded and interpretable, unlike an unbounded logit margin.
     arc_acc_floor: float = 0.90
+
+    # Optional SECOND guardrail, inside the greedy loop: does the model still write usable
+    # English with these units patched? ARC is forced-choice over a single token and can hold
+    # while free generation collapses — we measured exactly that dissociation. Checking it
+    # needs generation, so it is deliberately short and small; the deterministic coherence
+    # grader detects repetition, token collapse and non-ascii within ~128 tokens.
+    coh_floor: float = 0.90
+    coh_probe_n: int = 4
+    coh_probe_tokens: int = 128
     batch: int = 4
     seed: int = 0
 
@@ -328,6 +337,48 @@ class Funnel:
                 total += 1
         return right / max(1, total)
 
+    @torch.no_grad()
+    def coherence_probe(self, units: Sequence[Unit], fv: dict, system: str, user: str,
+                        th: "bm.CoherenceThresholds", n: int | None = None,
+                        max_new: int | None = None, seed: int = 0) -> float:
+        """Fraction of short completions that survive the deterministic coherence grader.
+
+        Uses the FROZEN vector rather than a live donor, because that is what the greedy loop
+        is choosing and what would actually be deployed. Short and few by design: this runs
+        once per greedy step, and degradation of the kind that matters (repetition, token
+        collapse, non-ascii) shows up well inside 128 tokens.
+        """
+        n = n or self.cfg.coh_probe_n
+        max_new = max_new or self.cfg.coh_probe_tokens
+        if not units:
+            return 1.0
+        hooks = self.frozen_hooks(units, "paste_mean", fv)
+        enc = self.tok(self.render(system, user), return_tensors="pt",
+                       add_special_tokens=False).to(self.model.device)
+        batch = {k: v.repeat(n, 1) for k, v in enc.items()}
+        torch.manual_seed(seed)
+        handles = hooks()
+        try:
+            out = self.model.generate(**batch, max_new_tokens=max_new, do_sample=True,
+                                      temperature=1.0, top_p=0.95,
+                                      pad_token_id=self.tok.pad_token_id)
+        finally:
+            for h in handles:
+                h.remove()
+        plen = enc["input_ids"].shape[1]
+        ok = 0
+        for j in range(n):
+            ids = [t for t in out[j, plen:].tolist() if t != self.tok.pad_token_id]
+            text = self.tok.decode(ids, skip_special_tokens=True)
+            # min_chars is calibrated for full rollouts; a 128-token probe is legitimately
+            # shorter, so only the shape checks apply here.
+            f = bm.coherence_features(text)
+            ok += int(f["repeat_frac"] <= th.max_repeat_frac
+                      and f["nonascii_frac"] <= th.max_nonascii_frac
+                      and f["top_token_frac"] <= th.max_top_token_frac)
+        bm.free_gpu()
+        return ok / n
+
     @staticmethod
     def mean_acts(caches: list[dict]) -> dict:
         acc: dict = {}
@@ -339,7 +390,14 @@ class Funnel:
     # -- the funnel --------------------------------------------------------------------
 
     def run(self, virus: Virus, control_items, cache_dir: Path,
-            verbose: bool = True) -> Antivirus:
+            verbose: bool = True, coh_guard: "bm.CoherenceThresholds | None" = None,
+            stack_tag: str = "") -> Antivirus:
+        """coh_guard: if given, a unit is rejected when adding it drops the short-generation
+        coherence probe below cfg.coh_floor. This is the "with coherence" stack. Passing None
+        reproduces the published search, which guards capability but not fluency.
+
+        stack_tag distinguishes the greedy cache between the two stacks while letting them
+        SHARE the expensive screen and rescore, which do not depend on the guard."""
         cfg = self.cfg
         MC = virus.mc_items()
         MC_S = MC[:cfg.n_screen]
@@ -386,6 +444,8 @@ class Funnel:
 
         # stage 2 — screen
         cache_dir.mkdir(parents=True, exist_ok=True)
+        # screen cache is keyed on the virus only — the guard does not change the screen, so
+        # the two stacks share this 11-minute step
         sp = cache_dir / f"screen_{virus.name}_{cfg.prior_topk}_{cfg.n_screen}.pkl"
         if sp.exists():
             screen = pickle.load(open(sp, "rb"))
@@ -443,6 +503,10 @@ class Funnel:
 
         # stage 4 — greedy stack
         picked, traj, best, since = [], [], None, 0
+        coh_now = 1.0
+        if coh_guard is not None:
+            say(f"  coherence guard ON (floor {cfg.coh_floor:.2f}, {cfg.coh_probe_n} probes "
+                f"of {cfg.coh_probe_tokens} tokens per step)")
         for u in rank:
             trial = picked + [u]
             m = self.margin(MC, trial, donor=D_M, system=virus.sys_bad) - M0
@@ -450,13 +514,26 @@ class Funnel:
             if abs(c) > ctrl_stop:
                 say(f"    +{label(u):9s} promo {m:+.3f} ARC {c:+.3f}  guardrail broken, rejected")
                 continue
+            if coh_guard is not None:
+                fv_trial = {x: {"donor": A_good[(x[0], x[1])][self.slice(x[1], x[2])],
+                                "recip": A_bad[(x[0], x[1])][self.slice(x[1], x[2])]}
+                            for x in trial}
+                coh_try = self.coherence_probe(trial, fv_trial, virus.sys_bad, virus.user,
+                                               coh_guard, seed=cfg.seed)
+                if coh_try < cfg.coh_floor:
+                    say(f"    +{label(u):9s} promo {m:+.3f} ARC {c:+.3f} coh {coh_try:.2f}"
+                        f"  COHERENCE broken, rejected")
+                    continue
+                coh_now = coh_try
             picked = trial
             traj.append({"u": u, "promo": m, "ctrl_shift": c})
             if best is None or m > best:
                 best, since = m, 0
             else:
                 since += 1
-            say(f"    +{label(u):9s} promo {m:+.3f} ARC {c:+.3f}  kept ({len(picked)})")
+            say(f"    +{label(u):9s} promo {m:+.3f} ARC {c:+.3f}"
+                + (f" coh {coh_now:.2f}" if coh_guard is not None else "")
+                + f"  kept ({len(picked)})")
             if since >= cfg.patience:
                 say("    patience exhausted")
                 break
@@ -504,7 +581,10 @@ class Funnel:
             paste_all_frac=float(frac),
             baselines={"S0": S0, "M0": M0, "C0": C0, "M_good": M_good, "C_good": C_good,
                        "ctrl_stop": ctrl_stop, "arc_acc_unpatched": arc_acc0,
-                       "arc_acc_patched": arc_best, "arc_acc_floor": cfg.arc_acc_floor},
+                       "arc_acc_patched": arc_best, "arc_acc_floor": cfg.arc_acc_floor,
+                       "coh_guarded": coh_guard is not None,
+                       "coh_probe_at_stop": coh_now if coh_guard is not None else None,
+                       "stack_tag": stack_tag},
         )
 
     # -- delivery ----------------------------------------------------------------------
@@ -553,7 +633,7 @@ class Funnel:
     @torch.no_grad()
     def generate_live_paste(self, units: Sequence[Unit], sys_bad: str, sys_clean: str,
                             user: str, n: int, cfg: bm.GenConfig, tag: str,
-                            out_path: Path) -> list[dict]:
+                            out_path: Path, live_batch: int = 4) -> list[dict]:
         """Lockstep dual generation: activations copied from a live donor forward.
 
         Donor and recipient have different prompt lengths, which would normally destroy
@@ -580,17 +660,27 @@ class Funnel:
         ids_cln = tok(self.render(sys_clean, user), return_tensors="pt",
                       add_special_tokens=False).input_ids.to(model.device)
 
+        # Live paste prefills TWO models and holds TWO KV caches. At a 2.5k-token prompt the
+        # MLP intermediate alone is ~1.2 GB per prefill at batch 16, and with both caches
+        # resident that overruns 80 GB. Cap the batch here rather than globally: the frozen
+        # arms have no donor and are happy at 16.
+        B_cap = max(1, min(cfg.batch_size, live_batch))
         while len(done) < n:
-            B = min(cfg.batch_size, n - len(done))
+            B = min(B_cap, n - len(done))
             i0 = len(done)
             torch.manual_seed(cfg.seed + i0)
             cur_b = ids_bad.repeat(B, 1)
             cur_c = ids_cln.repeat(B, 1)
             kv_b = kv_c = None
+            try:
+                torch.cuda.reset_peak_memory_stats()
+            except Exception:
+                pass
             out_ids = [[] for _ in range(B)]
             alive = torch.ones(B, dtype=torch.bool, device=model.device)
 
-            for _ in range(cfg.max_new_tokens):
+            try:
+              for _ in range(cfg.max_new_tokens):
                 store: dict = {}
                 hs = [self.module(li, k).register_forward_pre_hook(
                           self._recorder((li, k), store)) for li, k in sites]
@@ -631,6 +721,21 @@ class Funnel:
                 if not alive.any():
                     break
                 cur_b = cur_c = nxt          # same token to both — this is the alignment
+            except torch.cuda.OutOfMemoryError:
+                # Two prefills and two KV caches; the batch that fits depends on how long the
+                # completions run, which is not knowable in advance. Halve and retry rather
+                # than losing the run — nothing has been appended to `done` yet.
+                del kv_b, kv_c
+                kv_b = kv_c = None
+                bm.free_gpu()
+                if B_cap <= 1:
+                    raise RuntimeError(
+                        "live paste OOMs even at batch 1. Lower max_new_tokens, or run the "
+                        "frozen arms only — live paste needs roughly twice the memory of a "
+                        "normal generation because the donor runs alongside.")
+                B_cap = max(1, B_cap // 2)
+                print(f"    OOM at batch {B}; retrying at {B_cap}")
+                continue
 
             for j in range(B):
                 done.append({
