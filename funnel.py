@@ -186,9 +186,24 @@ class FunnelConfig:
     # 0.75 floor, i.e. 3 of 4. 8 halves the resolution to 0.125 and costs ~12 min inside a
     # 3.5 h run. Still not enough to quote the unit count as exact; enough to locate the
     # cliff to within a unit or two.
-    # Where a frozen vector is written at generation time. "last" matches the search;
-    # "all" is the more aggressive variant kept for comparison.
+    # Where a frozen vector is written at generation time. "last" matches the search
+    # exactly; nothing else is supported because clamping every prompt position is strictly
+    # more aggressive than anything the search measures.
     deliver_positions: str = "last"
+
+    # WHICH DELIVERY this run is building a stack for: "frozen" (one mean vector per unit,
+    # no donor at run time) or "live" (donor forward alongside, context-dependent values).
+    # One per run. Guarding the mode you are not going to ship is how a stack gets certified
+    # under one delivery and deployed under another, which is the mistake this replaces.
+    deliver: str = "frozen"
+
+    # Probe budget as a multiple of the UNPATCHED model's own completion length, measured
+    # once at the start. Termination cannot discriminate inside a budget the healthy model
+    # would not finish in either, and that length is model-dependent — a 4B writes shorter
+    # answers than a 12B, so a fixed 1536 is wrong for both.
+    coh_budget_mult: float = 1.5
+    coh_budget_min: int = 256
+    coh_budget_max: int = 2048
 
     coh_probe_n: int = 8
     coh_probe_tokens: int = 1536
@@ -391,7 +406,10 @@ class Funnel:
         max_new = max_new or self.cfg.coh_probe_tokens
         if not units:
             units_hooks = None
-        hooks = (self.frozen_hooks(units, "paste_mean", fv, positions=self.cfg.deliver_positions)
+        if units and self.cfg.deliver == "live":
+            return self._live_probe(units, system, user, th, n, max_new, seed)
+        hooks = (self.frozen_hooks(units, "paste_mean", fv,
+                                   positions=self.cfg.deliver_positions)
                  if units else (lambda: []))
         enc = self.tok(self.render(system, user), return_tensors="pt",
                        add_special_tokens=False).to(self.model.device)
@@ -429,6 +447,38 @@ class Funnel:
         # stops early rather than degenerating. min_chars from the full grader cannot be
         # reused (a 128-token probe is legitimately short), so length is judged RELATIVE to
         # the unpatched model measured under identical settings.
+        return {"ok": ok / n, "ended": ended / n, "chars": float(np.mean(chars)),
+                "repeat": float(np.mean(reps)), "repeat_max": float(np.max(reps))}
+
+    @torch.no_grad()
+    def _live_probe(self, units, system, user, th, n, max_new, seed) -> dict:
+        """Short live-paste generation, scored the same way as the frozen probe.
+
+        Reuses generate_live_paste so the probe measures exactly the delivery the live
+        notebook ships — including the lockstep alignment and the donor's dependence on the
+        recipient's own output, neither of which a frozen probe reproduces.
+        """
+        import tempfile
+        cfg = bm.GenConfig(max_new_tokens=max_new, temperature=1.0, top_p=0.95,
+                           batch_size=min(4, n), seed=seed)
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tf:
+            tmp = Path(tf.name)
+        try:
+            rolls = self.generate_live_paste(units, system, self._live_clean, user, n, cfg,
+                                             "probe", tmp, live_batch=min(4, n),
+                                             cond=f"probe:{len(units)}")
+        finally:
+            tmp.unlink(missing_ok=True)
+        ok, chars, ended, reps = 0, [], 0, []
+        for r in rolls:
+            f = bm.coherence_features(r["text"])
+            chars.append(f["n_chars"]); reps.append(f["repeat_frac"])
+            ended += int(not r["hit_cap"])
+            ok += int(f["repeat_frac"] <= th.max_repeat_frac
+                      and f["nonascii_frac"] <= th.max_nonascii_frac
+                      and f["top_token_frac"] <= th.max_top_token_frac)
+        bm.free_gpu()
+        n = max(1, len(rolls))
         return {"ok": ok / n, "ended": ended / n, "chars": float(np.mean(chars)),
                 "repeat": float(np.mean(reps)), "repeat_max": float(np.max(reps))}
 
@@ -608,11 +658,27 @@ class Funnel:
         picked, traj, best, since = [], [], None, 0
         coh_now, coh_base = 1.0, None
         if coh_guard is not None:
+            # Size the probe budget from the model's own completion length rather than a
+            # constant, then hold it for the rest of the run.
+            self._live_clean = virus.sys_clean
+            probe0 = self.coherence_probe([], {}, virus.sys_bad, virus.user, coh_guard,
+                                          n=cfg.coh_probe_n, max_new=cfg.coh_budget_max,
+                                          seed=cfg.seed)
+            natural = probe0["chars"] / 3.6                      # ~3.6 chars per token
+            budget = int(min(cfg.coh_budget_max,
+                             max(cfg.coh_budget_min, natural * cfg.coh_budget_mult)))
+            self.cfg.coh_probe_tokens = budget
+            say(f"  unpatched completes in ~{natural:.0f} tokens; probe budget set to "
+                f"{budget} ({cfg.coh_budget_mult:g}x)")
             coh_base = self.coherence_probe([], {}, virus.sys_bad, virus.user, coh_guard,
                                             seed=cfg.seed)
-            say(f"  coherence guard ON (terminate floor {cfg.coh_end_floor:.2f}, shape floor "
-                f"{cfg.coh_floor:.2f}). Unpatched probe: terminated "
-                f"{coh_base['ended']:.2f}, shape {coh_base['ok']:.2f}")
+            say(f"  coherence guard ON, delivery={cfg.deliver} (terminate floor "
+                f"{cfg.coh_end_floor:.2f}, shape floor {cfg.coh_floor:.2f}, repeat cap "
+                f"{max(coh_guard.max_repeat_frac, coh_base['repeat'] + cfg.coh_repeat_delta):.3f}). "
+                f"Unpatched: terminated {coh_base['ended']:.2f}, repeat {coh_base['repeat']:.3f}")
+            if coh_base["ended"] < 0.75:
+                say("  WARNING: the unpatched model does not terminate inside the probe "
+                    "budget, so the guard cannot discriminate. Raise coh_budget_mult.")
         for u in rank:
             trial = picked + [u]
             m = self.margin(MC, trial, donor=D_M, system=virus.sys_bad) - M0
@@ -642,14 +708,22 @@ class Funnel:
                         "rejected")
                     continue
                 coh_now = pr["ended"]
+                trial_fit = (m / headroom if abs(headroom) > 1e-9 else 0.0) * pr["ended"]
+            # THE OBJECTIVE. With the coherence guard on, a unit is kept only if it
+            # improves recovered x terminated — so effect bought at the cost of the model's
+            # ability to finish a sentence is not an improvement. Without the guard this
+            # falls back to promotion alone, which is the published behaviour.
+            fit = trial_fit if coh_guard is not None else m
             picked = trial
-            traj.append({"u": u, "promo": m, "ctrl_shift": c})
-            if best is None or m > best:
-                best, since = m, 0
+            traj.append({"u": u, "promo": m, "ctrl_shift": c,
+                         "terminated": coh_now if coh_guard is not None else None,
+                         "fitness": fit})
+            if best is None or fit > best:
+                best, since = fit, 0
             else:
                 since += 1
             say(f"    +{label(u):9s} promo {m:+.3f} ARC {c:+.3f}"
-                + (f" coh {coh_now:.2f}" if coh_guard is not None else "")
+                + (f" term {coh_now:.2f} fit {fit:.3f}" if coh_guard is not None else "")
                 + f"  kept ({len(picked)})")
             if since >= cfg.patience:
                 say("    patience exhausted")
@@ -659,8 +733,19 @@ class Funnel:
                 f"{virus.name}: no unit passed the guardrail. Recalibrate ctrl_stop_frac — "
                 "the published transfer result was that this knob does not carry across "
                 "models, and it will not carry across viruses either.")
-        bi = int(np.argmax([t["promo"] for t in traj]))
+        # argmax over fitness, not promotion. Guard against a flat trajectory: if every
+        # step scored identically there is no best and picking index 0 would be arbitrary.
+        _fit = [t["fitness"] for t in traj]
+        if max(_fit) - min(_fit) < 1e-12 and len(_fit) > 1:
+            raise RuntimeError(
+                f"{virus.name}: every greedy step scored identically ({_fit[0]:+.4f}); "
+                "argmax over equal values means nothing. Nothing was found.")
+        bi = int(np.argmax(_fit))
         best_set = picked[:bi + 1]
+        if coh_guard is not None:
+            say(f"  best fitness {_fit[bi]:.3f} at {bi+1} units "
+                f"(recovered {traj[bi]['promo']/headroom:.0%} x terminated "
+                f"{traj[bi]['terminated']:.2f})")
 
         # THE CAPABILITY TEST. The margin guardrail above is a permissive search heuristic;
         # this is the criterion the source work actually selected on (arc >= 0.9). If the

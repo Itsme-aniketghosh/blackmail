@@ -143,6 +143,13 @@ REGISTRY: dict[str, ModelSpec] = {
                   notes="family axis, mid-size"),
         ModelSpec("llama31-8b", "meta-llama/Llama-3.1-8B-Instruct", "llama3", 8.0, 16.1,
                   notes="family axis, small; cheap smoke target"),
+        # Small and recent, chosen for unit count per GiB. Qwen3-4B has 36 layers x 32 heads
+        # = 1152 head units — the SAME search space as Gemma 3 12B — at a third the weights,
+        # so the funnel explores identically while every forward pass is ~3x cheaper.
+        ModelSpec("qwen3-4b", "Qwen/Qwen3-4B", "qwen3", 4.0, 8.1, gated=False,
+                  notes="36 layers, 32 heads: same unit count as gemma3-12b at 1/3 the size"),
+        ModelSpec("qwen3-1.7b", "Qwen/Qwen3-1.7B", "qwen3", 1.7, 3.5, gated=False,
+                  notes="28 layers, fastest usable option; check the base rate survives"),
     ]
 }
 
