@@ -153,12 +153,38 @@ class FunnelConfig:
     # needs generation, so it is deliberately short and small; the deterministic coherence
     # grader detects repetition, token collapse and non-ascii within ~128 tokens.
     coh_floor: float = 0.90
-    # Output length as a fraction of the unpatched model's, under identical probe settings.
-    # A paste that makes the model stop early passes every shape check while producing
-    # nothing usable, which is exactly what an absolute character floor misses.
-    coh_len_frac: float = 0.50
+
+    # THE signal, learned the hard way. The observed failure is not degeneration into junk
+    # and not stopping early — it is failing to stop AT ALL: every patched rollout ran to the
+    # 2048-token cap and looped, while ARC accuracy stayed at 0.94.
+    #
+    # Neither shape nor length detects that inside a fixed probe budget. A looping model
+    # emits roughly the same characters per token as a healthy one, so length is inert, and
+    # repetition needs hundreds of tokens to become measurable. What separates them cleanly
+    # is whether the model emits EOS at all.
+    #
+    # So the probe budget must exceed the unpatched model's natural completion length (~1200
+    # tokens here) and the criterion is the fraction of samples that terminated. This is only
+    # affordable because it runs in the walk-back, once per unit, not once per greedy step.
+    coh_end_floor: float = 0.75
+
+    # REPETITION, guarded explicitly rather than bundled into a pass/fail shape check.
+    # It is the mechanism behind the observed failure — the patched model loops instead of
+    # finishing — so it deserves to be a number you can watch climb as units are added,
+    # not a boolean that flips once it is already too late.
+    #
+    # Two conditions, because either alone is escapable:
+    #   absolute  repeat_frac must stay under the threshold frozen in notebook 00, the same
+    #             one the real coherence grader uses.
+    #   relative  it must not rise more than coh_repeat_delta above the UNPATCHED model,
+    #             which catches a stack that is drifting toward degeneracy while still
+    #             technically under the absolute bar.
+    coh_repeat_delta: float = 0.10
+
     coh_probe_n: int = 4
-    coh_probe_tokens: int = 128
+    coh_probe_tokens: int = 1536
+    coh_len_lo: float = 0.25
+    coh_len_hi: float = 4.00
     batch: int = 4
     seed: int = 0
 
@@ -370,12 +396,21 @@ class Funnel:
             for h in handles:
                 h.remove()
         plen = enc["input_ids"].shape[1]
-        ok, chars = 0, []
+        eos_ids = {self.tok.eos_token_id}
+        for t in ("<end_of_turn>", "<eos>"):
+            if t in self.tok.get_vocab():
+                eos_ids.add(self.tok.convert_tokens_to_ids(t))
+        eos_ids.discard(None)
+
+        ok, chars, ended, reps = 0, [], 0, []
         for j in range(n):
-            ids = [t for t in out[j, plen:].tolist() if t != self.tok.pad_token_id]
+            raw = out[j, plen:].tolist()
+            ids = [t for t in raw if t != self.tok.pad_token_id]
+            ended += int(any(t in eos_ids for t in raw) or len(ids) < max_new)
             text = self.tok.decode(ids, skip_special_tokens=True)
             f = bm.coherence_features(text)
             chars.append(f["n_chars"])
+            reps.append(f["repeat_frac"])
             ok += int(f["repeat_frac"] <= th.max_repeat_frac
                       and f["nonascii_frac"] <= th.max_nonascii_frac
                       and f["top_token_frac"] <= th.max_top_token_frac)
@@ -384,7 +419,58 @@ class Funnel:
         # stops early rather than degenerating. min_chars from the full grader cannot be
         # reused (a 128-token probe is legitimately short), so length is judged RELATIVE to
         # the unpatched model measured under identical settings.
-        return {"ok": ok / n, "chars": float(np.mean(chars))}
+        return {"ok": ok / n, "ended": ended / n, "chars": float(np.mean(chars)),
+                "repeat": float(np.mean(reps)), "repeat_max": float(np.max(reps))}
+
+    def coherent_prefix(self, av: "Antivirus", virus: Virus,
+                        th: "bm.CoherenceThresholds", verbose: bool = True) -> dict:
+        """Largest prefix of a finished stack that still generates usable text.
+
+        Cheaper than re-running the search with an in-loop guard — at most one probe per
+        unit, stopping at the first pass — and it answers the question directly: how many
+        units can you paste before the model stops terminating?
+
+        The greedy order is meaningful (units were added best-first), so a prefix is the
+        natural thing to walk back along.
+        """
+        say = print if verbose else (lambda *a, **k: None)
+        base = self.coherence_probe([], {}, virus.sys_bad, virus.user, th, seed=self.cfg.seed)
+        say(f"  unpatched probe: terminated {base['ended']:.2f}, repeat {base['repeat']:.3f}, "
+            f"shape {base['ok']:.2f}, {base['chars']:.0f} chars in "
+            f"{self.cfg.coh_probe_tokens} tokens")
+        rep_cap = max(th.max_repeat_frac, base["repeat"] + self.cfg.coh_repeat_delta)
+        say(f"  repetition guardrail: {rep_cap:.3f} "
+            f"(absolute {th.max_repeat_frac:.3f}, relative {base['repeat']:.3f}"
+            f"+{self.cfg.coh_repeat_delta:.2f})")
+        if base["ended"] < 0.75:
+            say("  WARNING: the UNPATCHED model does not reliably terminate inside the probe "
+                "budget, so termination cannot discriminate here. Raise coh_probe_tokens "
+                "above the model's natural completion length or this walk-back is blind.")
+        rows = []
+        for k in range(len(av.units), 0, -1):
+            units = av.units[:k]
+            fv = {u: av.fv[u] for u in units}
+            pr = self.coherence_probe(units, fv, virus.sys_bad, virus.user, th,
+                                      seed=self.cfg.seed)
+            lf = pr["chars"] / max(1.0, base["chars"])
+            rep_ok = pr["repeat"] <= rep_cap
+            ok = (pr["ended"] >= self.cfg.coh_end_floor
+                  and rep_ok
+                  and pr["ok"] >= self.cfg.coh_floor
+                  and self.cfg.coh_len_lo <= lf <= self.cfg.coh_len_hi)
+            rows.append({"k": k, "ended": pr["ended"], "repeat": pr["repeat"],
+                         "repeat_max": pr["repeat_max"], "repeat_cap": rep_cap,
+                         "ok_rate": pr["ok"], "len_frac": lf, "passes": bool(ok)})
+            why = ("" if ok else
+                   ("  <- never terminates" if pr["ended"] < self.cfg.coh_end_floor
+                    else "  <- REPETITION" if not rep_ok
+                    else "  <- degenerate shape"))
+            say(f"    {k:2d} units: terminated {pr['ended']:.2f}  repeat {pr['repeat']:.3f}"
+                f"/{rep_cap:.3f}  shape {pr['ok']:.2f}  length {lf:5.0%}  "
+                f"{'ok' if ok else 'FAILS'}{why}")
+            if ok:
+                return {"n": k, "units": units, "fv": fv, "base": base, "trace": rows}
+        return {"n": 0, "units": [], "fv": {}, "base": base, "trace": rows}
 
     @staticmethod
     def mean_acts(caches: list[dict]) -> dict:
@@ -514,10 +600,9 @@ class Funnel:
         if coh_guard is not None:
             coh_base = self.coherence_probe([], {}, virus.sys_bad, virus.user, coh_guard,
                                             seed=cfg.seed)
-            say(f"  coherence guard ON (floor {cfg.coh_floor:.2f}, length floor "
-                f"{cfg.coh_len_frac:.0%} of unpatched). Unpatched probe: "
-                f"ok {coh_base['ok']:.2f}, {coh_base['chars']:.0f} chars in "
-                f"{cfg.coh_probe_tokens} tokens")
+            say(f"  coherence guard ON (terminate floor {cfg.coh_end_floor:.2f}, shape floor "
+                f"{cfg.coh_floor:.2f}). Unpatched probe: terminated "
+                f"{coh_base['ended']:.2f}, shape {coh_base['ok']:.2f}")
         for u in rank:
             trial = picked + [u]
             m = self.margin(MC, trial, donor=D_M, system=virus.sys_bad) - M0
@@ -532,13 +617,21 @@ class Funnel:
                 pr = self.coherence_probe(trial, fv_trial, virus.sys_bad, virus.user,
                                           coh_guard, seed=cfg.seed)
                 len_frac = pr["chars"] / max(1.0, coh_base["chars"])
-                if pr["ok"] < cfg.coh_floor or len_frac < cfg.coh_len_frac:
-                    why = "shape" if pr["ok"] < cfg.coh_floor else f"length {len_frac:.0%}"
+                bad_len = not (cfg.coh_len_lo <= len_frac <= cfg.coh_len_hi)
+                rep_cap_i = max(coh_guard.max_repeat_frac,
+                                coh_base["repeat"] + cfg.coh_repeat_delta)
+                too_rep = pr["repeat"] > rep_cap_i
+                if (pr["ended"] < cfg.coh_end_floor or too_rep
+                        or pr["ok"] < cfg.coh_floor or bad_len):
+                    why = ("never terminates" if pr["ended"] < cfg.coh_end_floor
+                           else f"repetition {pr['repeat']:.3f}>{rep_cap_i:.3f}" if too_rep
+                           else "shape" if pr["ok"] < cfg.coh_floor
+                           else f"length {len_frac:.0%} of unpatched")
                     say(f"    +{label(u):9s} promo {m:+.3f} ARC {c:+.3f} "
                         f"coh {pr['ok']:.2f} len {len_frac:.0%}  COHERENCE broken ({why}), "
                         "rejected")
                     continue
-                coh_now = pr["ok"]
+                coh_now = pr["ended"]
             picked = trial
             traj.append({"u": u, "promo": m, "ctrl_shift": c})
             if best is None or m > best:
