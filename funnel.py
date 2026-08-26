@@ -532,6 +532,55 @@ class Funnel:
                 return {"n": k, "units": units, "fv": fv, "base": base, "trace": rows}
         return {"n": 0, "units": [], "fv": {}, "base": base, "trace": rows}
 
+    @torch.no_grad()
+    def menu_probs(self, items: list[dict], units: Sequence[Unit] = (), fv: dict | None = None,
+                   system: str = "", live_clean: str | None = None) -> dict:
+        """P(each option) under the model, with the given units patched.
+
+        One forward per item, no generation — so nothing here can be confounded by the
+        model losing the ability to write. Probabilities are a softmax over ONLY the option
+        letters, so they sum to one over the choices actually offered.
+
+        Also returns `flat`, the mean total probability mass the model puts on the option
+        letters at all. A model damaged into incoherence spreads its mass elsewhere in the
+        vocabulary; if `flat` collapses, the choice distribution is not measuring preference
+        and should not be read as one.
+        """
+        hooks = (self.frozen_hooks(units, "paste_mean", fv,
+                                   positions=self.cfg.deliver_positions)
+                 if units else (lambda: []))
+        labels = sorted({k for it in items for k in it["letters"]})
+        totals = {k: 0.0 for k in labels}
+        mass, n_seen, B = 0.0, 0, self.cfg.batch
+
+        for s0 in range(0, len(items), B):
+            batch = items[s0:s0 + B]
+            enc = self.tok([self.render(system, it["prompt"]) for it in batch],
+                           return_tensors="pt", padding=True,
+                           add_special_tokens=False).to(self.model.device)
+            handles = hooks()
+            try:
+                logits = self.model(**enc).logits[:, -1].float()
+            finally:
+                for h in handles:
+                    h.remove()
+            for j, it in enumerate(batch):
+                ids = {lab: self.tok.encode(L, add_special_tokens=False)[-1]
+                       for lab, L in it["letters"].items()}
+                sel = torch.tensor([ids[lab] for lab in it["letters"]],
+                                   device=logits.device)
+                sub = logits[j].index_select(0, sel)
+                pr = torch.softmax(sub, dim=-1)
+                full = torch.softmax(logits[j], dim=-1)
+                mass += float(full.index_select(0, sel).sum())
+                n_seen += 1
+                for k, lab in enumerate(it["letters"]):
+                    totals[lab] += float(pr[k])
+        bm.free_gpu()
+        out = {lab: totals[lab] / max(1, n_seen) for lab in labels}
+        out["flat"] = mass / max(1, n_seen)
+        return out
+
     @staticmethod
     def mean_acts(caches: list[dict]) -> dict:
         acc: dict = {}
