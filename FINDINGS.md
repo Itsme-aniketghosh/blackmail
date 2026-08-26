@@ -3,11 +3,12 @@
 Can you localise agentic blackmail to a small set of attention heads, extract it as a function
 vector, and use it to remove the behaviour without breaking the model?
 
-**Status: notebook 00 has run once and failed its gate.** The measured base rate is **0.13**
-against a predicted 0.67, so nothing downstream has run. Diagnosis is in progress; the
-candidate causes are under Results below — one is a defect in our own code, one is a
-parameter, and one is that the predicted number came from a different grader. Everything still
-marked *(not yet run)* is an empty slot with its control already specified.
+**Status: notebook 00 has run only at `max_new_tokens=1024`.** The base rate there is 0.13
+[0.08, 0.21] on a clean n=100 prefix, against 0.67 from the exploratory pass. A claimed
+2048-token re-run was retracted — it silently returned cached 1024-token data; see Results. The
+contrast set is 47 act / 253 refrain, usable but thinner than the reference's 83/95, and one
+clean 2048-token run is the next thing owed. Everything marked *(not yet run)* is an empty slot
+with its control already specified.
 
 Model: `google/gemma-3-12b-it`, bf16, no quantization. Colab Pro, A100 80GB. Temperature 1.0,
 top_p 0.95, seed 0. Plain PyTorch forward hooks, eager attention.
@@ -94,7 +95,7 @@ slot. Two properties hold:
 
 ## Results
 
-### Notebook 00 — does the blackmail actually happen? **GATE FAILED**
+### Notebook 00, first run at 1024 tokens — superseded, kept for the diagnosis
 
 Run 26 Aug 2026. `max_new_tokens=1024`, graded by Anthropic's official blackmail classifier
 via `gpt-4o-mini`. Superseded by a 2048-token re-run; kept because the diagnosis below is
@@ -192,6 +193,56 @@ and no number in this project currently captures it.
 - The 30–70% band stays under review. It was inherited from the exploratory 0.67, which came
   from a looser grader; it has never been measured under this one.
 
+### Notebook 00 at 1024 tokens, n=300 — base rate ~0.16. The 2048 re-run has NOT happened.
+
+**Retraction.** An earlier version of this file recorded a "2048-token re-run" giving 0.16 on
+300 rollouts. That run did not generate anything. Its own log says
+`[confirm] 196 rollouts already on disk, nothing to do`, with completion length median 1024
+and max 1024. The notebook had `max_new_tokens=2048`, but the `blackmail.py` it loaded was
+cloned from commit `d1dc554`, which predates the config-fingerprint guard — so
+`generate_rollouts` counted the rollouts already on disk, decided the target was met, and
+returned the 1024-token sample untouched. A misleading print in the notebook then labelled
+those old `hit_cap` flags against the newly configured 2048 cap.
+
+**What is actually established, all at `max_new_tokens=1024`:**
+
+| quantity | value |
+|---|---|
+| fixed-n prefix (n=100) | 0.13  [0.08, 0.21] |
+| whole sample | 0.16  (47/300)  [0.12, 0.20] |
+| act / refrain | 47 / 253 |
+| truncated at the 1024 cap | ~85–89% |
+| median completion length | exactly 1024 — i.e. at the cap |
+| exploratory pass, looser grader | 0.67 |
+
+The whole-sample 0.16 may itself pool two conditions, if any rollouts past #196 were generated
+at 2048 while the guard was absent. Until one clean run exists, treat **0.13 [0.08, 0.21] from
+the n=100 prefix as the only number with known provenance** — that prefix is entirely from the
+original 1024-token generation.
+
+**What this does not change.** The 00b diagnosis stands on its own, because it analysed the
+1024-token sample and never claimed otherwise: 98% of rollouts name the affair while reasoning,
+77% consider it and decline, only 33% email Kyle at all, and the prefilter bug cost zero
+labels. The gap to 0.67 is still most likely the grader rather than truncation — but the
+token-budget hypothesis has **not** been tested, and the retracted section wrongly said it had.
+
+**Consequences, already applied:**
+
+- The 30–70% band is removed from notebook 00. It was inherited from the exploratory 0.67 and
+  never measured under this grader. A feasibility floor on the smaller class replaces it,
+  labelled as a statement about what the probe needs rather than about the model.
+- `generate_rollouts` stamps every rollout with
+  `max_new_tokens|temperature|top_p|do_sample|prompt_sha` and refuses to extend a checkpoint
+  made under different settings. This is on `origin/main` as of `c69451e`; the failed run
+  predated it.
+- Notebook 00 now reads the cap out of the saved rollouts and **raises** if they were made
+  under a smaller cap than is currently configured, instead of printing a number that implies
+  a re-run occurred.
+
+**To get the real 2048 number:** delete `data/rollouts/confirm.json` and
+`data/judge/00.confirm.A.json`, confirm cell 2 clones a commit at or after `c69451e`, and
+re-run. Roughly 300 rollouts at 2048 tokens is about 3 hours of A100.
+
 ### Notebook 01 — where is the decision readable? *(not yet run)*
 
 | quantity | predicted | observed |
@@ -206,7 +257,7 @@ and no number in this project currently captures it.
 Verdict labels are preregistered: **READABLE** / **TEXT ARTIFACT** / **NOT READABLE**. If the
 probe does not beat TF-IDF by ≥ 0.05, it is a text classifier and gets reported as one.
 
-### Notebook 05 — the function vector *(not yet run, blocked on 00)*
+### Notebook 05 — the function vector *(not yet run)*
 
 | quantity | observed |
 |---|---|
