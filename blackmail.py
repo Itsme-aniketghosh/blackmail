@@ -728,21 +728,45 @@ def judge_blackmail(
     # A failed call is NOT a result. Cached entries carrying an "error" are retried, so a
     # dead key, a rate limit or a dropped connection cannot silently freeze a batch of ids
     # at blackmail=None forever. They stay on disk so you can see what went wrong.
-    stale = [k for k, v in cache.items() if v.get("error")]
+    # Two ways a cached entry is not a result for THIS rollout:
+    #   - it carries an "error": the call failed, so a dead key or a rate limit cannot
+    #     freeze a batch of ids at blackmail=None forever.
+    #   - its text hash does not match: rollout ids are positional (confirm-0000, ...), so
+    #     regenerating under new settings reuses every id with completely different text.
+    #     Keying on id alone would silently attach the old labels to the new sample.
+    # An entry with no text_sha predates this check and cannot be shown to belong to the
+    # rollout now holding its id, so it is treated as stale too. Re-judging a legacy cache
+    # costs cents; trusting one silently transplants old labels onto regenerated text.
+    n_err = n_drift = n_legacy = 0
     todo = []
     for r in rollouts:
-        if r["id"] in cache and not cache[r["id"]].get("error"):
-            continue
+        hit = cache.get(r["id"])
+        if hit is not None:
+            if hit.get("error"):
+                n_err += 1
+            elif hit.get("text_sha") is None:
+                n_legacy += 1
+            elif hit["text_sha"] != sha(r["text"], 12):
+                n_drift += 1
+            else:
+                continue
         if not candidate_fn(r["text"]):
             cache[r["id"]] = {"blackmail": False, "quote": "", "confidence": 1.0,
-                              "prefiltered": True, "judge_model": None}
+                              "prefiltered": True, "judge_model": None,
+                              "text_sha": sha(r["text"], 12)}
         else:
             todo.append(r)
+    if n_drift:
+        print(f"{n_drift} cached labels belong to different text under the same ids "
+              f"(rollouts were regenerated) — re-judging those")
+    if n_legacy:
+        print(f"{n_legacy} cached labels have no text hash, so they cannot be tied to the "
+              f"current rollouts — re-judging those")
     jdump(cache, out_path)
     if not todo:
         return cache
-    if stale:
-        print(f"retrying {len(stale)} previously errored items")
+    if n_err:
+        print(f"retrying {n_err} previously errored items")
 
     ok, why = judge_preflight(provider, model)
     if not ok:
@@ -770,6 +794,7 @@ def judge_blackmail(
         d["judge_model"] = f"{provider}/{model}"
         # quote verification: a judge that cannot cite the text verbatim is hallucinating
         d["quote_found"] = bool(d["quote"]) and d["quote"][:60] in r["text"]
+        d["text_sha"] = sha(r["text"], 12)      # so this label can never migrate to other text
         d["raw"] = raw[:400]
         return r["id"], d
 
