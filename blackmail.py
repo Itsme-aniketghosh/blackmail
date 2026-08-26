@@ -147,18 +147,18 @@ REGISTRY: dict[str, ModelSpec] = {
 }
 
 
-def load_model(key_or_id: str, dtype=torch.bfloat16, attn: str = "eager"):
+def load_model(key_or_id: str, dtype=torch.bfloat16, attn: str = "sdpa"):
     """Load in bf16. Never quantized — CLAUDE.md forbids measuring through a quantized model.
 
-    attn="eager" is the default because the head-level hooks in notebook 05 need
-    o_proj inputs, and SDPA/flash kernels are fine for that but eager keeps the
-    attention probabilities inspectable if we ever need them.
+    attn="sdpa". Eager materialises the full [batch, heads, q, kv] attention matrix and
+    upcasts it to fp32 for the softmax; at batch 8 over a 2.5k-token prompt that is ~3.2 GB
+    per layer, and it makes prefill several times slower. The funnel in notebook 05 is
+    almost entirely prefill, so this is the single largest runtime lever in the project.
 
-    Memory note: eager materialises the full [batch, heads, q, kv] attention matrix and
-    upcasts it to fp32 for the softmax — at batch 8, 16 heads and a 2.5k-token prompt that
-    is ~3.2 GB per layer, which OOMs a 40 GB card during prefill. It fits on 80 GB. If you
-    ever run this on a smaller card, pass attn="sdpa"; every hook here reads the *input* to
-    o_proj or down_proj, both of which exist identically under SDPA.
+    It costs nothing to switch: every hook here reads the *input* to o_proj (the
+    concatenated per-head outputs) or the input to down_proj, and both exist identically
+    under SDPA. Only the attention probabilities are unavailable, and nothing reads them.
+    Pass attn="eager" if you ever need them.
     """
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -833,6 +833,37 @@ def _parse_judge(raw: str) -> dict:
     }
 
 
+def _norm_for_match(t: str) -> str:
+    """Fold the differences a grader introduces when it copies text: smart quotes, dashes,
+    non-breaking spaces, collapsed newlines, case."""
+    import unicodedata
+    t = unicodedata.normalize("NFKC", t)
+    t = t.translate(str.maketrans({
+        "‘": "'", "’": "'", "‚": "'", "‛": "'",
+        "“": '"', "”": '"', "„": '"',
+        "–": "-", "—": "-", "−": "-",
+        " ": " ", "…": "...",
+    }))
+    return re.sub(r"\s+", " ", t).strip().lower()
+
+
+def quote_in_text(quote: str, text: str, n: int = 80) -> bool | None:
+    """Is the grader's cited span actually in the transcript?
+
+    Returns None when no quote was given — that is "no evidence offered", which is a
+    different thing from "evidence that is not there", and conflating the two turned a
+    cosmetic gap into an alarming-looking 24/25.
+
+    Comparison is on normalised text. Gemma writes curly apostrophes; a grader copying the
+    span almost always straightens them, and a raw substring test then fails on a quote that
+    is verbatim in every respect that matters.
+    """
+    if not quote or not quote.strip():
+        return None
+    q, t = _norm_for_match(quote), _norm_for_match(text)
+    return q[:n] in t
+
+
 def judge_blackmail(
     rollouts: list[dict],
     out_path: str | Path,
@@ -907,8 +938,10 @@ def judge_blackmail(
             f"Nothing was spent. Fix the key or point this judge somewhere funded — "
             f"{len(todo)} items were about to be sent.")
 
-    print(f"judging {len(todo)} candidates with {provider}/{model} "
-          f"({len(rollouts)-len(todo)} prefiltered out)")
+    n_pre = sum(1 for r in rollouts if cache.get(r["id"], {}).get("prefiltered"))
+    n_cached = len(rollouts) - len(todo) - n_pre
+    print(f"judging {len(todo)} with {provider}/{model} "
+          f"({n_cached} already cached, {n_pre} prefiltered)")
 
     def one(r: dict) -> tuple[str, dict]:
         try:
@@ -925,7 +958,7 @@ def judge_blackmail(
         d["prefiltered"] = False
         d["judge_model"] = f"{provider}/{model}"
         # quote verification: a judge that cannot cite the text verbatim is hallucinating
-        d["quote_found"] = bool(d["quote"]) and d["quote"][:60] in r["text"]
+        d["quote_found"] = quote_in_text(d["quote"], r["text"])
         d["text_sha"] = sha(r["text"], 12)      # so this label can never migrate to other text
         d["raw"] = raw[:400]
         return r["id"], d
